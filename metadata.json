@@ -1,0 +1,7 @@
+{
+  "name": "ETERN - Visual AI Video Tutor",
+  "description": "An interactive, auto-playing visual tutor that generates video-style lessons with diagrams and narration on the fly.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
