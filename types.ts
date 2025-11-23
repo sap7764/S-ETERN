@@ -13,6 +13,7 @@ export interface LessonStep {
   imageUrl?: string; // Added to store the real fetched URL
   coordinates?: { top: number; left: number }; // AI-analyzed position
   sketchfab_model_id?: string; // ID for specific 3D models
+  model_interaction_points?: { narration: string; narration_hindi: string }[]; // Step-by-step 3D teaching points
 }
 
 export interface LessonPlan {
@@ -41,6 +42,15 @@ export interface FollowUpResponse {
   answer: string; // English
   answer_hindi: string; // Hindi
   targetStepIndex: number; // The step to jump back to for visual context
+}
+
+export interface SavedSession {
+  id: string;
+  topic: string;
+  lastActive: string;
+  lessonPlan: LessonPlan;
+  messages: ChatMessage[];
+  currentStepIndex: number;
 }
 
 // Web Speech API types

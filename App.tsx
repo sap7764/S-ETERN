@@ -1,24 +1,56 @@
 
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 import VisualPlayer from './components/VisualPlayer';
 import ChatInterface from './components/ChatInterface';
-import { LessonPlan, ChatMessage, PlayerState } from './types';
+import SideMenu from './components/SideMenu';
+import { LessonPlan, ChatMessage, PlayerState, SavedSession } from './types';
 import { generateLesson, generateFollowUp } from './services/geminiService';
+import { saveSessionToStorage, getSessionsFromStorage, deleteSessionFromStorage } from './services/storageService';
+import { Menu } from 'lucide-react';
 
 // Provided API Key for web scraping (SerpApi)
 const SCRAPER_API_KEY = 'c2d96985f10e88dd7a7115643319a938d26a0104fb6e417b9c8d8a7c863cfd83';
 
 const App: React.FC = () => {
+  const [sessionId, setSessionId] = useState<string>(uuidv4());
   const [lessonPlan, setLessonPlan] = useState<LessonPlan | null>(null);
   const [currentStepIndex, setCurrentStepIndex] = useState(0);
   const [playerState, setPlayerState] = useState<PlayerState>(PlayerState.IDLE);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
+  const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const [savedSessions, setSavedSessions] = useState<SavedSession[]>([]);
   
   // Default audio language (Hi = Hindi, En = English)
   const [audioLanguage, setAudioLanguage] = useState<'en' | 'hi'>('hi');
+
+  // Load saved sessions on mount
+  useEffect(() => {
+    setSavedSessions(getSessionsFromStorage());
+  }, []);
+
+  // Auto-save session effect
+  useEffect(() => {
+    if (lessonPlan && messages.length > 0) {
+      const sessionData: SavedSession = {
+        id: sessionId,
+        topic: lessonPlan.topic,
+        lastActive: new Date().toISOString(),
+        lessonPlan,
+        messages,
+        currentStepIndex
+      };
+      
+      const timeoutId = setTimeout(() => {
+        saveSessionToStorage(sessionData);
+        setSavedSessions(getSessionsFromStorage()); // Refresh list
+      }, 2000); // Debounce save
+
+      return () => clearTimeout(timeoutId);
+    }
+  }, [lessonPlan, messages, currentStepIndex, sessionId]);
 
   // Helper for timestamp
   const getTimestamp = () => {
@@ -28,17 +60,15 @@ const App: React.FC = () => {
   // Helper to fetch real image from SerpApi with CORS proxy
   const fetchRealImageUrl = async (query: string): Promise<string | null> => {
     try {
-      // We use a CORS proxy to allow the browser to make the request to SerpApi
       const baseUrl = "https://serpapi.com/search.json";
       const params = new URLSearchParams({
         engine: "google_images",
-        q: query + " labelled diagram educational HD", // Ensure query asks for labelled diagrams
+        q: query + " labelled diagram educational HD",
         api_key: SCRAPER_API_KEY,
         num: "1",
-        tbs: "isz:l" // Request Large size images for readability
+        tbs: "isz:l"
       });
       
-      // Wrap the target URL with a common CORS proxy for client-side usage
       const targetUrl = `${baseUrl}?${params.toString()}`;
       const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`;
       
@@ -58,27 +88,30 @@ const App: React.FC = () => {
   // Enrich plan with URLs and Preload
   const prepareLessonAssets = async (plan: LessonPlan) => {
     const promises = plan.steps.map(async (step, i) => {
-      // 1. Try to fetch a real image URL
+      // If URL already exists (from loaded session), preload it but don't re-fetch
+      if (step.imageUrl) {
+         return new Promise((resolve) => {
+            const img = new Image();
+            img.src = step.imageUrl!;
+            img.onload = resolve;
+            img.onerror = resolve;
+         });
+      }
+
       let url = await fetchRealImageUrl(step.diagram_scrape_query);
 
-      // 2. Fallback to generated image if fetch failed
       if (!url) {
-        // Fallback: Generate a clean schematic with NO TEXT. 
-        // Since AI generation text is illegible, we rely on the app's overlays.
         const encodedQuery = encodeURIComponent(`${step.diagram_scrape_query} clean minimalist educational diagram schematic, white background, no text, no labels, bold lines`);
-        // Use index based seed to ensure consistency
         url = `https://image.pollinations.ai/prompt/${encodedQuery}?width=1280&height=720&nologo=true&seed=${i + 200}`;
       }
 
-      // 3. Store URL in the step object
       step.imageUrl = url;
 
-      // 4. Preload the image into browser cache
       return new Promise((resolve) => {
         const img = new Image();
         img.src = url!;
         img.onload = resolve;
-        img.onerror = resolve; // Resolve anyway to allow lesson to proceed
+        img.onerror = resolve;
       });
     });
 
@@ -87,7 +120,6 @@ const App: React.FC = () => {
 
   // Core logic to handle new messages
   const handleSendMessage = async (text: string) => {
-    // Add user message
     const userMsg: ChatMessage = { 
       id: uuidv4(), 
       role: 'user', 
@@ -102,17 +134,13 @@ const App: React.FC = () => {
         // SCENARIO 1: New Lesson
         setPlayerState(PlayerState.LOADING);
         
-        // 1. Generate Plan
         const plan = await generateLesson(text);
         
-        // 2. Fetch & Pre-load all images (Real scraping + Fallback)
         await prepareLessonAssets(plan);
 
-        // 3. Set State
         setLessonPlan(plan);
         setCurrentStepIndex(0);
 
-        // 4. Add Tutor intro message
         const tutorMsg: ChatMessage = {
           id: uuidv4(),
           role: 'tutor',
@@ -121,7 +149,6 @@ const App: React.FC = () => {
         };
         setMessages(prev => [...prev, tutorMsg]);
         
-        // 5. Start Playback
         setPlayerState(PlayerState.PLAYING);
       
       } else {
@@ -130,13 +157,10 @@ const App: React.FC = () => {
 
         const response = await generateFollowUp(text, lessonPlan);
         
-        // Jump to the relevant step for visual context
         if (response.targetStepIndex >= 0 && response.targetStepIndex < lessonPlan.steps.length) {
             setCurrentStepIndex(response.targetStepIndex);
-            // Image is already cached in lessonPlan.steps[i].imageUrl
         }
         
-        // Determine answer text based on selected language
         const answerText = audioLanguage === 'hi' && response.answer_hindi 
             ? response.answer_hindi 
             : response.answer;
@@ -149,9 +173,7 @@ const App: React.FC = () => {
         };
         setMessages(prev => [...prev, tutorMsg]);
 
-        // Speak the answer immediately using the same TTS engine
         const utterance = new SpeechSynthesisUtterance(answerText);
-        // Prioritize voices
         const voices = window.speechSynthesis.getVoices();
         let preferredVoice = null;
         if (audioLanguage === 'hi') {
@@ -187,7 +209,6 @@ const App: React.FC = () => {
 
     if (currentStepIndex < lessonPlan.steps.length - 1) {
       setCurrentStepIndex(prev => prev + 1);
-      // If next is clicked, ensure we are playing
       if (playerState !== PlayerState.PLAYING) {
         setPlayerState(PlayerState.PLAYING);
       }
@@ -199,7 +220,6 @@ const App: React.FC = () => {
   const handlePrevStep = useCallback(() => {
     if (currentStepIndex > 0) {
       setCurrentStepIndex(prev => prev - 1);
-      // If back is clicked, ensure we continue playing from there
       setPlayerState(PlayerState.PLAYING);
     }
   }, [currentStepIndex]);
@@ -211,13 +231,66 @@ const App: React.FC = () => {
     setPlayerState(PlayerState.PLAYING);
   };
 
+  const handleSelectSession = async (session: SavedSession) => {
+      // Reset state first
+      setIsLoading(true);
+      setPlayerState(PlayerState.LOADING);
+      
+      // Load saved data
+      setSessionId(session.id);
+      setMessages(session.messages);
+      
+      // Re-prepare assets (check cache)
+      if (session.lessonPlan) {
+          await prepareLessonAssets(session.lessonPlan);
+          setLessonPlan(session.lessonPlan);
+          setCurrentStepIndex(session.currentStepIndex);
+          setPlayerState(PlayerState.PAUSED); // Start paused so user is ready
+      }
+      
+      setIsLoading(false);
+  };
+
+  const handleDeleteSession = (id: string, e: React.MouseEvent) => {
+      e.stopPropagation();
+      setSavedSessions(deleteSessionFromStorage(id));
+      if (id === sessionId) {
+          handleNewChat();
+      }
+  };
+
+  const handleNewChat = () => {
+      setSessionId(uuidv4());
+      setLessonPlan(null);
+      setMessages([]);
+      setCurrentStepIndex(0);
+      setPlayerState(PlayerState.IDLE);
+  };
+
   return (
     <div className="h-screen w-full flex flex-col md:flex-row bg-black text-white overflow-hidden font-sans selection:bg-white/30 selection:text-white">
       
+      <SideMenu 
+        isOpen={isMenuOpen} 
+        onClose={() => setIsMenuOpen(false)} 
+        sessions={savedSessions}
+        onSelectSession={handleSelectSession}
+        onDeleteSession={handleDeleteSession}
+        onNewChat={handleNewChat}
+      />
+
+      {/* Main Menu Trigger */}
+      <button 
+        onClick={() => setIsMenuOpen(true)}
+        className="absolute top-6 left-6 z-50 p-2.5 bg-black/60 backdrop-blur-xl border border-white/20 rounded-full text-white hover:bg-white hover:text-black transition-all shadow-lg"
+      >
+        <Menu size={20} />
+      </button>
+
       {/* Left / Top: Visual Area */}
       <div className="w-full md:w-2/3 h-[45vh] md:h-full p-0 md:p-6 flex flex-col items-center justify-center relative border-b md:border-b-0 md:border-r border-white/10 bg-black">
         <div className="absolute inset-0 bg-cyber-grid bg-[length:40px_40px] opacity-10 pointer-events-none"></div>
-        <div className="w-full max-w-5xl px-2 md:px-0 z-10">
+        <div className="w-full max-w-5xl px-2 md:px-0 z-10 pt-10 md:pt-0"> {/* Added padding top for mobile menu clearance */}
           <VisualPlayer 
             step={lessonPlan ? lessonPlan.steps[currentStepIndex] : null}
             totalSteps={lessonPlan?.steps.length || 0}
