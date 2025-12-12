@@ -1,12 +1,12 @@
-
 import { GoogleGenAI, Type, Schema } from "@google/genai";
 import { LessonPlan, FollowUpResponse } from "../types";
 
 // Initialize Google GenAI Client
-// The API key is obtained exclusively from the environment variable process.env.API_KEY
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-const MODEL_NAME = "gemini-3-pro-preview";
+// LATENCY OPTIMIZATION: Use Flash model for text generation (much faster than Pro)
+const MODEL_NAME = "gemini-2.5-flash"; 
+const IMAGE_MODEL_NAME = "gemini-2.5-flash-image"; 
 
 // --- Schemas for Structured Output ---
 
@@ -14,42 +14,51 @@ const lessonStepSchema: Schema = {
   type: Type.OBJECT,
   properties: {
     index: { type: Type.INTEGER },
-    title: { type: Type.STRING },
+    title: { 
+      type: Type.STRING,
+      description: "Short title."
+    },
     narration: { 
       type: Type.STRING, 
-      description: "The spoken narration script for this step in ENGLISH." 
+      description: "Spoken explanation. Adjust complexity based on user intent." 
     },
     narration_hindi: { 
       type: Type.STRING, 
-      description: "The spoken narration script for this step in HINDI (Devanagari script)." 
+      description: "Hindi translation." 
     },
     narration_3d: {
-      type: Type.STRING,
-      description: "A short guide in ENGLISH explaining what to explore in the 3D model (e.g., 'Rotate the model to see...'). Only required if sketchfab_model_id is present."
+      type: Type.STRING, 
+      description: "3D guide."
     },
     narration_3d_hindi: {
       type: Type.STRING,
-      description: "A short guide in HINDI explaining what to explore in the 3D model. Only required if sketchfab_model_id is present."
+      description: "3D guide Hindi."
     },
     diagram_scrape_query: { 
       type: Type.STRING, 
-      description: "Search query for finding the diagram. MUST be in ENGLISH, optimized for Google Images (e.g., 'labeled diagram of heart high resolution')." 
+      description: "Detailed prompt for a visual object (e.g. 'cross section of a leaf'). Avoid abstract concepts." 
     },
-    diagram_role: { type: Type.STRING },
+    diagram_role: { type: Type.STRING, description: "Diagram role." },
     overlay_description: { 
       type: Type.STRING, 
-      description: "Short visual label (1-3 words) for the overlay. MUST be in ENGLISH." 
+      description: "Highlight area description." 
+    },
+    coordinates: {
+      type: Type.OBJECT,
+      properties: {
+        top: { type: Type.INTEGER },
+        left: { type: Type.INTEGER }
+      },
+      required: ["top", "left"]
     },
     suggested_duration_ms: { 
-      type: Type.INTEGER, 
-      description: "Duration in milliseconds, approx 4000-8000." 
+      type: Type.INTEGER 
     },
     sketchfab_model_id: {
-      type: Type.STRING,
-      description: "If the step matches a 3D model context, return one of these IDs: '447ba8d6d1b74668853fd6096ec89435' (General Photosynthesis), 'f258c65762e5435c9d58c1aa136b557a' (Plant Cell), '9a244f04a73d46cd8801fd3d9d40726b' (Chloroplast). Return null if no 3D model applies."
+      type: Type.STRING
     }
   },
-  required: ["index", "title", "narration", "narration_hindi", "diagram_scrape_query", "diagram_role", "overlay_description", "suggested_duration_ms"]
+  required: ["index", "title", "narration", "narration_hindi", "diagram_scrape_query", "diagram_role", "overlay_description", "coordinates", "suggested_duration_ms"]
 };
 
 const lessonPlanSchema: Schema = {
@@ -68,16 +77,22 @@ const followUpSchema: Schema = {
   type: Type.OBJECT,
   properties: {
     answer: { 
-      type: Type.STRING, 
-      description: "Conversational answer in ENGLISH, 2-3 sentences." 
+      type: Type.STRING 
     },
     answer_hindi: { 
-      type: Type.STRING, 
-      description: "Conversational answer in HINDI (Devanagari script), 2-3 sentences." 
+      type: Type.STRING 
     },
     targetStepIndex: { 
-      type: Type.INTEGER, 
-      description: "The index of the existing lesson step that best visually explains this answer." 
+      type: Type.INTEGER,
+      description: "The index of the step that best helps explain the answer."
+    },
+    is_off_topic: {
+      type: Type.BOOLEAN,
+      description: "Set to true if the user's question is completely unrelated to the current lesson context (e.g. asking about cars in a biology lesson)."
+    },
+    new_topic_query: {
+      type: Type.STRING,
+      description: "If is_off_topic is true, extract the new subject the user wants to learn about."
     }
   },
   required: ["answer", "answer_hindi", "targetStepIndex"]
@@ -86,33 +101,27 @@ const followUpSchema: Schema = {
 // --- API Functions ---
 
 export const generateLesson = async (prompt: string): Promise<LessonPlan> => {
-  const systemInstruction = `You are ETERN, an advanced visual AI tutor. 
-  Your goal is to create a visual video-style lesson plan.
+  const systemInstruction = `You are ETERN, an advanced Adaptive Visual AI Tutor.
   
-  AVAILABLE 3D ASSETS:
-  You have access to 3 specific interactive 3D models. If the lesson topic relates to Photosynthesis, you MUST incorporate these into relevant steps by returning their IDs in the 'sketchfab_model_id' field.
+  **CORE OBJECTIVE:**
+  Analyze the user's input to determine the Learning Depth.
   
-  1. ID: "447ba8d6d1b74668853fd6096ec89435"
-     - Content: General Photosynthesis process, sunlight hitting leaves.
-     - Usage: Use this for introduction steps, sunlight absorption, or general process overview.
-     
-  2. ID: "f258c65762e5435c9d58c1aa136b557a"
-     - Content: Eukaryotic Plant Cell (Whole Cell).
-     - Usage: Use this when explaining where photosynthesis happens in the cell, cell walls, or vacuoles.
-     
-  3. ID: "9a244f04a73d46cd8801fd3d9d40726b"
-     - Content: Chloroplast (Detailed Organelle).
-     - Usage: Use this for deep dives into thylakoids, stroma, light-dependent reactions, or the chlorophyll pigment.
+  1. **Simple Queries** (e.g., "What is an atom?", "Define gravity"):
+     - Create a **3-4 step** overview.
+     - Keep narration simple, concise, and beginner-friendly.
+  
+  2. **Complex/Deep Queries** (e.g., "How does a car engine work?", "Explain the Krebs cycle details", "Quantum entanglement"):
+     - Create a **6-9 step** deep-dive presentation.
+     - Break down the process minutely.
+     - Use more technical narration suitable for a student wanting mastery.
+  
+  **VISUAL GUIDELINES:**
+  - One distinct visual concept per step.
+  - 'diagram_scrape_query': Must be a highly descriptive image prompt (e.g., "cutaway view of a V8 engine piston cycle", "microscopic view of mitochondria inner membrane").
+  
+  Output: JSON only.`;
 
-  RULES:
-  1. Generate content in both ENGLISH and HINDI.
-  2. Diagram search queries MUST be in ENGLISH.
-  3. Overlay descriptions MUST be in ENGLISH (1-3 words max).
-  4. Create 3-6 steps.
-  5. If using a 3D model, provide 'narration_3d' and 'narration_3d_hindi' which guides the user to interact (e.g., "Use your finger to rotate the chloroplast and find the green thylakoid stacks...").
-  `;
-
-  const userPrompt = `Create a visual video-style lesson plan for a 14-year-old student about: "${prompt}".`;
+  const userPrompt = `Create a specialized lesson for: "${prompt}"`;
 
   try {
     const response = await ai.models.generateContent({
@@ -122,7 +131,7 @@ export const generateLesson = async (prompt: string): Promise<LessonPlan> => {
         systemInstruction: systemInstruction,
         responseMimeType: "application/json",
         responseSchema: lessonPlanSchema,
-        temperature: 0.4, 
+        temperature: 0.2, 
       }
     });
 
@@ -137,29 +146,50 @@ export const generateLesson = async (prompt: string): Promise<LessonPlan> => {
   }
 };
 
+export const generateDiagram = async (prompt: string): Promise<string | null> => {
+  try {
+    const finalPrompt = `high quality educational textbook illustration of ${prompt}, white background, clear scientific diagram, flat vector style, no text labels, accurate`;
+    
+    const response = await ai.models.generateContent({
+      model: IMAGE_MODEL_NAME,
+      contents: {
+        parts: [{ text: finalPrompt }],
+      },
+      config: {
+        imageConfig: { aspectRatio: "16:9" } 
+      }
+    });
+
+    for (const part of response.candidates?.[0]?.content?.parts || []) {
+      if (part.inlineData) {
+        return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+      }
+    }
+    return null;
+  } catch (error) {
+    console.error("Diagram generation error:", error);
+    return null;
+  }
+};
+
 export const generateFollowUp = async (
   question: string, 
   currentLesson: LessonPlan
 ): Promise<FollowUpResponse> => {
   try {
-    // Create a simplified context string
     const contextStr = JSON.stringify(currentLesson.steps.map(s => ({ 
       index: s.index, 
       title: s.title, 
       label: s.overlay_description,
-      has3DModel: !!s.sketchfab_model_id
     })));
 
-    const systemInstruction = `You are ETERN. Answer the student's follow-up question based on the visual lesson context.
-    
-    RULES:
-    1. Provide answer in both ENGLISH and HINDI.
-    2. Keep answer conversational and short (2-3 sentences).
-    3. Choose the best step index to show visually while answering.
-    `;
+    const systemInstruction = `You are ETERN. 
+    Lesson paused. Student question.
+    1. Check if the question fits the current topic context: ${currentLesson.topic}.
+    2. If it fits, pick the best existing diagram step to show and provide a short answer (1-3 sentences).
+    3. If the question is completely UNRELATED (e.g. asking about Space during a Human Anatomy lesson), set 'is_off_topic' to true and extract the new topic into 'new_topic_query'.`;
 
-    const userPrompt = `Question: "${question}".
-    Lesson Context: ${contextStr}.`;
+    const userPrompt = `Q: "${question}". Context: ${contextStr}.`;
 
     const response = await ai.models.generateContent({
       model: MODEL_NAME,

@@ -42,6 +42,8 @@ export interface FollowUpResponse {
   answer: string; // English
   answer_hindi: string; // Hindi
   targetStepIndex: number; // The step to jump back to for visual context
+  is_off_topic?: boolean; // If true, the question is unrelated to the current lesson
+  new_topic_query?: string; // The extracted topic for the new lesson
 }
 
 export interface SavedSession {

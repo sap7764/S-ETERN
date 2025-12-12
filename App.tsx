@@ -1,16 +1,13 @@
-
 import React, { useState, useCallback, useEffect } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 import VisualPlayer from './components/VisualPlayer';
 import ChatInterface from './components/ChatInterface';
 import SideMenu from './components/SideMenu';
 import { LessonPlan, ChatMessage, PlayerState, SavedSession } from './types';
-import { generateLesson, generateFollowUp } from './services/geminiService';
+import { generateLesson, generateFollowUp, generateDiagram } from './services/geminiService';
+import { generateGeminiTTS } from './services/ttsService'; // Imported for pre-caching
 import { saveSessionToStorage, getSessionsFromStorage, deleteSessionFromStorage } from './services/storageService';
 import { Menu } from 'lucide-react';
-
-// Provided API Key for web scraping (SerpApi)
-const SCRAPER_API_KEY = 'c2d96985f10e88dd7a7115643319a938d26a0104fb6e417b9c8d8a7c863cfd83';
 
 const App: React.FC = () => {
   const [sessionId, setSessionId] = useState<string>(uuidv4());
@@ -24,7 +21,7 @@ const App: React.FC = () => {
   const [savedSessions, setSavedSessions] = useState<SavedSession[]>([]);
   
   // Default audio language (Hi = Hindi, En = English)
-  const [audioLanguage, setAudioLanguage] = useState<'en' | 'hi'>('hi');
+  const [audioLanguage, setAudioLanguage] = useState<'en' | 'hi'>('en');
 
   // Load saved sessions on mount
   useEffect(() => {
@@ -52,70 +49,90 @@ const App: React.FC = () => {
     }
   }, [lessonPlan, messages, currentStepIndex, sessionId]);
 
+  // SMART AUDIO PRE-CACHING
+  // Instead of loading all at once (which causes 429s), we load the *next* step gently.
+  useEffect(() => {
+    if (!lessonPlan || currentStepIndex >= lessonPlan.steps.length - 1) return;
+
+    const nextStep = lessonPlan.steps[currentStepIndex + 1];
+    const textToPreload = audioLanguage === 'hi' ? nextStep.narration_hindi : nextStep.narration;
+
+    // We delay the pre-load to ensure the *current* step's request has priority
+    // and to space out requests.
+    const timer = setTimeout(() => {
+        generateGeminiTTS(textToPreload).catch(err => {
+            // Ignore errors here, just a pre-fetch
+            console.warn("Background audio pre-fetch skipped");
+        });
+    }, 4000);
+
+    return () => clearTimeout(timer);
+  }, [currentStepIndex, lessonPlan, audioLanguage]);
+
   // Helper for timestamp
   const getTimestamp = () => {
     return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   };
 
-  // Helper to fetch real image from SerpApi with CORS proxy
-  const fetchRealImageUrl = async (query: string): Promise<string | null> => {
-    try {
-      const baseUrl = "https://serpapi.com/search.json";
-      const params = new URLSearchParams({
-        engine: "google_images",
-        q: query + " labelled diagram educational HD",
-        api_key: SCRAPER_API_KEY,
-        num: "1",
-        tbs: "isz:l"
-      });
-      
-      const targetUrl = `${baseUrl}?${params.toString()}`;
-      const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`;
-      
-      const response = await fetch(proxyUrl);
-      if (!response.ok) throw new Error('Network response was not ok');
-      
-      const data = await response.json();
-      if (data.images_results && data.images_results.length > 0) {
-        return data.images_results[0].original;
-      }
-    } catch (error) {
-      console.warn("Error fetching real image (CORS/API limit), falling back to generated:", error);
-    }
-    return null;
+  // Enriches the plan with images in the background
+  const startBackgroundAssetGeneration = (plan: LessonPlan) => {
+    plan.steps.forEach(async (step, index) => {
+        
+        // 1. Audio Pre-caching - REMOVED to prevent 429 Quota errors
+        // We now handle this via the useEffect above (Just-In-Time loading)
+
+        // 2. Image Generation
+        if (step.imageUrl) return; // Already has image
+
+        try {
+            // Generate visual using Gemini Image Model
+            const url = await generateDiagram(step.diagram_scrape_query);
+            
+            // Optimized Fallback for Valid Diagrams
+            const finalUrl = url || `https://image.pollinations.ai/prompt/${encodeURIComponent(step.diagram_scrape_query + " educational textbook diagram white background no text")}?width=960&height=540&nologo=true&seed=${index + 999}`;
+
+            // Preload to ensure smoother transition when state updates
+            const img = new Image();
+            img.src = finalUrl;
+            img.onload = () => {
+                setLessonPlan(prev => {
+                    if (!prev || prev.topic !== plan.topic) return prev; // Safety check if user switched topic
+                    const newSteps = [...prev.steps];
+                    newSteps[index] = { ...newSteps[index], imageUrl: finalUrl };
+                    return { ...prev, steps: newSteps };
+                });
+            };
+        } catch (e) {
+            console.error(`Error generating asset for step ${index}`, e);
+        }
+    });
   };
 
-  // Enrich plan with URLs and Preload
-  const prepareLessonAssets = async (plan: LessonPlan) => {
-    const promises = plan.steps.map(async (step, i) => {
-      // If URL already exists (from loaded session), preload it but don't re-fetch
-      if (step.imageUrl) {
-         return new Promise((resolve) => {
-            const img = new Image();
-            img.src = step.imageUrl!;
-            img.onload = resolve;
-            img.onerror = resolve;
-         });
-      }
+  // Helper: Start a new lesson from scratch
+  const createNewLesson = async (topic: string, newId: string) => {
+      setPlayerState(PlayerState.LOADING);
+      setSessionId(newId);
+      
+      // 1. Generate text structure
+      const plan = await generateLesson(topic);
+      
+      // 2. Set plan IMMEDIATELY
+      setLessonPlan(plan);
+      setCurrentStepIndex(0);
+      
+      const tutorMsg: ChatMessage = {
+        id: uuidv4(),
+        role: 'tutor',
+        text: `I've prepared a specialized lesson on "${plan.topic}".`,
+        timestamp: getTimestamp()
+      };
+      setMessages([tutorMsg]);
+      
+      // 3. Start player
+      setPlayerState(PlayerState.PLAYING);
 
-      let url = await fetchRealImageUrl(step.diagram_scrape_query);
-
-      if (!url) {
-        const encodedQuery = encodeURIComponent(`${step.diagram_scrape_query} clean minimalist educational diagram schematic, white background, no text, no labels, bold lines`);
-        url = `https://image.pollinations.ai/prompt/${encodedQuery}?width=1280&height=720&nologo=true&seed=${i + 200}`;
-      }
-
-      step.imageUrl = url;
-
-      return new Promise((resolve) => {
-        const img = new Image();
-        img.src = url!;
-        img.onload = resolve;
-        img.onerror = resolve;
-      });
-    });
-
-    await Promise.all(promises);
+      // 4. Background assets (Images only)
+      startBackgroundAssetGeneration(plan);
   };
 
   // Core logic to handle new messages
@@ -131,32 +148,36 @@ const App: React.FC = () => {
 
     try {
       if (!lessonPlan) {
-        // SCENARIO 1: New Lesson
-        setPlayerState(PlayerState.LOADING);
-        
-        const plan = await generateLesson(text);
-        
-        await prepareLessonAssets(plan);
-
-        setLessonPlan(plan);
-        setCurrentStepIndex(0);
-
-        const tutorMsg: ChatMessage = {
-          id: uuidv4(),
-          role: 'tutor',
-          text: `Great! I've prepared a visual lesson about "${plan.topic}". Watch the screen above.`,
-          timestamp: getTimestamp()
-        };
-        setMessages(prev => [...prev, tutorMsg]);
-        
-        setPlayerState(PlayerState.PLAYING);
-      
+        // SCENARIO 1: New Lesson (Initial)
+        await createNewLesson(text, sessionId);
       } else {
         // SCENARIO 2: Follow-up Question
         setPlayerState(PlayerState.PAUSED);
 
         const response = await generateFollowUp(text, lessonPlan);
+
+        // Check for Context Switch
+        if (response.is_off_topic && response.new_topic_query) {
+             const switchMsg: ChatMessage = {
+                id: uuidv4(),
+                role: 'tutor',
+                text: `That sounds like a new topic. Let me prepare a specialized lesson on "${response.new_topic_query}" for you.`,
+                timestamp: getTimestamp()
+             };
+             setMessages(prev => [...prev, switchMsg]);
+             
+             // Wait briefly then switch
+             setTimeout(async () => {
+                 // Clean restart with new session ID
+                 setLessonPlan(null);
+                 setMessages([]); 
+                 await createNewLesson(response.new_topic_query!, uuidv4());
+                 setIsLoading(false);
+             }, 1000);
+             return; // Exit here, async callback handles the rest
+        }
         
+        // Normal Follow-up Logic
         if (response.targetStepIndex >= 0 && response.targetStepIndex < lessonPlan.steps.length) {
             setCurrentStepIndex(response.targetStepIndex);
         }
@@ -173,6 +194,7 @@ const App: React.FC = () => {
         };
         setMessages(prev => [...prev, tutorMsg]);
 
+        // Just use WebSpeech for quick textual answers in chat to keep it snappy
         const utterance = new SpeechSynthesisUtterance(answerText);
         const voices = window.speechSynthesis.getVoices();
         let preferredVoice = null;
@@ -194,7 +216,7 @@ const App: React.FC = () => {
       const errorMsg: ChatMessage = {
         id: uuidv4(),
         role: 'tutor',
-        text: "I'm having trouble connecting to my knowledge base. Please check your API key or try again.",
+        text: "I'm having trouble connecting right now. Please try again.",
         timestamp: getTimestamp()
       };
       setMessages(prev => [...prev, errorMsg]);
@@ -239,15 +261,13 @@ const App: React.FC = () => {
       // Load saved data
       setSessionId(session.id);
       setMessages(session.messages);
+      setLessonPlan(session.lessonPlan);
+      setCurrentStepIndex(session.currentStepIndex);
       
-      // Re-prepare assets (check cache)
-      if (session.lessonPlan) {
-          await prepareLessonAssets(session.lessonPlan);
-          setLessonPlan(session.lessonPlan);
-          setCurrentStepIndex(session.currentStepIndex);
-          setPlayerState(PlayerState.PAUSED); // Start paused so user is ready
-      }
+      // Check if any images are missing (legacy or incomplete save)
+      startBackgroundAssetGeneration(session.lessonPlan);
       
+      setPlayerState(PlayerState.PAUSED); 
       setIsLoading(false);
   };
 
@@ -288,29 +308,26 @@ const App: React.FC = () => {
       </button>
 
       {/* Left / Top: Visual Area */}
-      <div className="w-full md:w-2/3 h-[45vh] md:h-full p-0 md:p-6 flex flex-col items-center justify-center relative border-b md:border-b-0 md:border-r border-white/10 bg-black">
-        <div className="absolute inset-0 bg-cyber-grid bg-[length:40px_40px] opacity-10 pointer-events-none"></div>
-        <div className="w-full max-w-5xl px-2 md:px-0 z-10 pt-10 md:pt-0"> {/* Added padding top for mobile menu clearance */}
-          <VisualPlayer 
-            step={lessonPlan ? lessonPlan.steps[currentStepIndex] : null}
-            totalSteps={lessonPlan?.steps.length || 0}
-            currentStepIndex={currentStepIndex}
-            playerState={playerState}
-            onNextStep={handleNextStep}
-            onPrevStep={handlePrevStep}
-            onPlay={handlePlay}
-            onPause={handlePause}
-            onRestart={handleRestart}
-            isMuted={isMuted}
-            toggleMute={() => setIsMuted(!isMuted)}
-            audioLanguage={audioLanguage}
-            setAudioLanguage={setAudioLanguage}
-          />
-        </div>
+      <div className="w-full md:w-2/3 aspect-video md:aspect-auto md:h-full flex flex-col items-center justify-center relative bg-black border-b md:border-b-0 md:border-r border-white/10 z-10 shadow-2xl">
+        <VisualPlayer 
+          step={lessonPlan ? lessonPlan.steps[currentStepIndex] : null}
+          totalSteps={lessonPlan?.steps.length || 0}
+          currentStepIndex={currentStepIndex}
+          playerState={playerState}
+          onNextStep={handleNextStep}
+          onPrevStep={handlePrevStep}
+          onPlay={handlePlay}
+          onPause={handlePause}
+          onRestart={handleRestart}
+          isMuted={isMuted}
+          toggleMute={() => setIsMuted(!isMuted)}
+          audioLanguage={audioLanguage}
+          setAudioLanguage={setAudioLanguage}
+        />
       </div>
 
-      {/* Right / Bottom: Chat Area (White Theme) */}
-      <div className="w-full md:w-1/3 h-[55vh] md:h-full flex flex-col bg-white border-l border-gray-200 shadow-2xl relative">
+      {/* Right / Bottom: Chat Area */}
+      <div className="w-full md:w-1/3 flex-1 flex flex-col shadow-2xl relative z-20 min-h-0">
         <ChatInterface 
           messages={messages} 
           onSendMessage={handleSendMessage}
